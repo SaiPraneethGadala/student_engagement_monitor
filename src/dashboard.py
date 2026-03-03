@@ -12,13 +12,21 @@ import plotly.express as px
 import os
 import time
 import threading
+from datetime import timedelta
 
 # ---------- Page Setup ----------
 st.set_page_config(page_title="Student Engagement Dashboard", layout="wide")
 st.title("🎓 Student Engagement Dashboard")
 
-LOGS_DIR = "logs"
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
 REFRESH_INTERVAL = 2  # seconds (faster refresh for live tracking)
+
+
+def stop_app(message):
+    """Stop cleanly in Streamlit and in bare python/debug runs."""
+    st.warning(message)
+    raise SystemExit(0)
 
 # ---------- Initialize Session State ----------
 if "last_update" not in st.session_state:
@@ -45,8 +53,6 @@ def monitor_logs_directory():
                         csv_files,
                         key=lambda f: os.path.getmtime(os.path.join(LOGS_DIR, f))
                     )
-                    latest_mtime = os.path.getmtime(os.path.join(LOGS_DIR, latest_file))
-                    
                     # If file changed, trigger refresh
                     if (st.session_state.last_file != latest_file or 
                         time.time() - st.session_state.last_update > REFRESH_INTERVAL):
@@ -97,15 +103,22 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 csv_files = sorted([f for f in os.listdir(LOGS_DIR) if f.endswith(".csv")], reverse=True)
 
 if not csv_files:
-    st.warning("⚠️ No session logs found. Run realtime_monitor.py first.")
-    st.stop()
+    stop_app("No session logs found. Run realtime_monitor.py first.")
 
 # Option to follow the latest running session (the one realtime_monitor.py is
 # currently writing). When enabled we auto-select the newest CSV.
 follow_latest = st.checkbox("Follow latest running session (auto-select)", value=True)
 # Always get the most recently modified file when following latest
 if follow_latest:
-    files_with_mtime = [(f, os.path.getmtime(os.path.join(LOGS_DIR, f))) for f in csv_files]
+    files_with_mtime = []
+    for f in csv_files:
+        file_path = os.path.join(LOGS_DIR, f)
+        if os.path.isfile(file_path):
+            files_with_mtime.append((f, os.path.getmtime(file_path)))
+
+    if not files_with_mtime:
+        stop_app("No readable session logs found right now. Please try again in a moment.")
+
     selected_file = max(files_with_mtime, key=lambda x: x[1])[0]
     st.write(f"📍 Following: **{selected_file}** | Refresh count: {st.session_state.refresh_trigger}")
 else:
@@ -128,8 +141,7 @@ _ = st.session_state.refresh_trigger  # Reference to trigger rerun
 df = load_session_data(path)
 
 if df.empty or "label" not in df.columns:
-    st.warning("⚠️ Selected log file has no valid data.")
-    st.stop()
+    stop_app("Selected log file has no valid data.")
 
 # ---------- Manual Refresh Button ----------
 col1, col2 = st.columns([3, 1])
@@ -142,35 +154,55 @@ with col2:
 st.markdown("### 📊 Engagement Summary")
 summary = df["label"].value_counts(normalize=True) * 100
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 col1.metric("Attentive", f"{summary.get('Attentive', 0):.1f}%")
 col2.metric("Confused", f"{summary.get('Confused', 0):.1f}%")
 col3.metric("Distracted", f"{summary.get('Distracted', 0):.1f}%")
+col4.metric("Sleeping", f"{summary.get('Sleeping', 0):.1f}%")
 
 st.divider()
 
 # ---------- Charts ----------
 fig_pie = px.pie(
     df, names="label", title="Engagement Breakdown",
-    color_discrete_map={"Attentive": "green", "Confused": "gold", "Distracted": "red"}
+    color_discrete_map={"Attentive": "green", "Confused": "gold", "Distracted": "red", "Sleeping": "royalblue"}
 )
-st.plotly_chart(fig_pie, width=None)
+st.plotly_chart(fig_pie, use_container_width=True)
 
 st.divider()
 
-df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-timeline = df.groupby(["timestamp", "label"]).size().reset_index(name="count")
+df["timestamp"] = pd.to_datetime(df["timestamp"], format="%H:%M:%S", errors="coerce")
+if df["timestamp"].isna().all():
+    # Fallback: build a synthetic timeline so the line chart still renders.
+    start = pd.Timestamp.now().floor("s")
+    df["timestamp"] = [start + timedelta(seconds=i) for i in range(len(df))]
+else:
+    df["timestamp"] = df["timestamp"].fillna(method="ffill")
+    if df["timestamp"].isna().any():
+        first_valid = df["timestamp"].dropna()
+        if not first_valid.empty:
+            df["timestamp"] = df["timestamp"].fillna(first_valid.iloc[0])
+        else:
+            start = pd.Timestamp.now().floor("s")
+            df["timestamp"] = [start + timedelta(seconds=i) for i in range(len(df))]
+
+timeline = df.groupby(["timestamp", "label"], dropna=False).size().reset_index(name="count")
 
 fig_line = px.line(
     timeline, x="timestamp", y="count", color="label",
     title="Engagement Over Time",
-    color_discrete_map={"Attentive": "green", "Confused": "gold", "Distracted": "red"},
+    color_discrete_map={"Attentive": "green", "Confused": "gold", "Distracted": "red", "Sleeping": "royalblue"},
     markers=True
 )
-st.plotly_chart(fig_line, width=None)
+if timeline.empty:
+    st.warning("Timeline data is empty for the selected session.")
+else:
+    st.plotly_chart(fig_line, use_container_width=True)
 
 # ---------- Data Table ----------
 with st.expander("📄 View Raw Data"):
-    st.dataframe(df.tail(50), width=None)
+    st.dataframe(df.tail(50), use_container_width=True)
 
 st.success("✅ Dashboard running smoothly!")
+
+
